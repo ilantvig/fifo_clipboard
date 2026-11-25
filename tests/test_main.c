@@ -12,10 +12,10 @@
 #include <wchar.h>
 #include <stdbool.h>
 
-#include "../fifo_queue.h"
-#include "../app_logic.h"
-#include "../settings.h"
-#include "../clipboard.h"
+#include "fifo_queue.h"
+#include "app_logic.h"
+#include "settings.h"
+#include "clipboard.h"
 
 static int g_checks = 0;
 static int g_failed = 0;
