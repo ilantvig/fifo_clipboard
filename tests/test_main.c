@@ -4,6 +4,9 @@
 #ifndef WINVER
 #define WINVER 0x0A00
 #endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000004   /* NTDDI_WIN10_RS3 */
+#endif
 #include <windows.h>
 #include <strsafe.h>
 #include <stdio.h>
@@ -19,6 +22,8 @@
 
 static int g_checks = 0;
 static int g_failed = 0;
+static int g_fail_after = -1;
+
 
 #define CHECK(cond) do { \
     ++g_checks; \
@@ -26,6 +31,31 @@ static int g_failed = 0;
 } while (0)
 
 /* ================= Очередь ================= */
+static void *test_alloc(size_t n)
+{
+    if (g_fail_after == 0) return NULL;
+    if (g_fail_after > 0) --g_fail_after;
+    return malloc(n);
+}
+static void test_free(void *p) { free(p); }
+
+static void test_queue_oom_keeps_old(void)
+{
+    FifoQueue q; FQ_Init(&q);
+    q.maxItems = 2;
+    FQ_Push(&q, L"A"); FQ_Push(&q, L"B");
+
+    FQ_SetAllocator(test_alloc, test_free);
+    g_fail_after = 0;                        /* падают все аллокации */
+    CHECK(FQ_Push(&q, L"C") == FQ_PUSH_NOMEM);
+    g_fail_after = -1;
+    FQ_SetAllocator(NULL, NULL);
+
+    CHECK(FQ_Count(&q) == 2);                /* старые уцелели */
+    wchar_t *t = FQ_PopFront(&q); CHECK(t && wcscmp(t, L"A") == 0); FQ_FreeText(t);
+    t = FQ_PopFront(&q);          CHECK(t && wcscmp(t, L"B") == 0); FQ_FreeText(t);
+}
+
 static void test_queue_init(void)
 {
     FifoQueue q; FQ_Init(&q);
@@ -128,6 +158,21 @@ static void test_queue_max_total_bytes(void)
     FQ_Clear(&q);
 }
 
+static void test_queue_zero_limits(void)
+{
+    FifoQueue q; FQ_Init(&q);
+    q.maxItems = 0;
+    CHECK(FQ_Push(&q, L"a") == FQ_PUSH_TOO_LARGE); /* ничего не добавляется */
+    CHECK(FQ_IsEmpty(&q));
+    FQ_Clear(&q);
+
+    FQ_Init(&q);
+    q.maxTotalBytes = 0;
+    CHECK(FQ_Push(&q, L"") == FQ_PUSH_TOO_LARGE); /* даже пустая строка не влезает */
+    CHECK(FQ_IsEmpty(&q));
+    FQ_Clear(&q);
+}
+
 static void test_queue_restore_front(void)
 {
     FifoQueue q; FQ_Init(&q);
@@ -165,6 +210,14 @@ static void test_queue_stress(void)
     FQ_Clear(&q);
 }
 
+static void test_queue_pushfront_owned_null(void)
+{
+    FifoQueue q; FQ_Init(&q);
+    CHECK(FQ_PushFrontOwned(&q, NULL) == false);
+    CHECK(FQ_PushFrontOwned(NULL, NULL) == false);
+    CHECK(FQ_IsEmpty(&q));
+}
+
 /* ================= Логика ================= */
 static void test_intercept_truth_table(void)
 {
@@ -190,6 +243,20 @@ static void test_classify(void)
     CHECK(Logic_ClassifyClipboardUpdate(0, 0, 0) == CLIP_IGNORE_DUP);
 }
 
+static void test_classify_own_range(void)
+{
+    /* уведомление от EmptyClipboard приходит с более старым seq */
+    CHECK(Logic_ClassifyClipboardUpdate(4, 3, 5) == CLIP_IGNORE_OWN);
+    CHECK(Logic_ClassifyClipboardUpdate(5, 3, 5) == CLIP_IGNORE_OWN);
+    CHECK(Logic_ClassifyClipboardUpdate(6, 5, 5) == CLIP_PROCESS);
+    /* ownPasteSeq == 0 -> подавление выключено */
+    CHECK(Logic_ClassifyClipboardUpdate(1, 0, 0) == CLIP_PROCESS);
+    /* wrap-around */
+    CHECK(Logic_ClassifyClipboardUpdate(0, 0xFFFFFFFFu, 0xFFFFFFFFu) == CLIP_PROCESS);
+    CHECK(Logic_ClassifyClipboardUpdate(1, 0xFFFFFFFFu, 0xFFFFFFFFu) == CLIP_PROCESS);
+    CHECK(Logic_ClassifyClipboardUpdate(0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFFFFu) == CLIP_IGNORE_OWN);
+}
+
 static void test_format_icon(void)
 {
     wchar_t b[16];
@@ -199,6 +266,19 @@ static void test_format_icon(void)
     Logic_FormatIconText(123, true, b, 16); CHECK(wcscmp(b, L"123") == 0);
     Logic_FormatIconText(64, true, b, 2);  CHECK(wcscmp(b, L"6") == 0); /* безопасное усечение */
     Logic_FormatIconText(1, true, NULL, 0); /* не падает */
+}
+
+static void test_format_icon_caps(void)
+{
+    wchar_t b[16];
+    b[0] = L'X';
+    Logic_FormatIconText(5, true, b, 0);  CHECK(b[0] == L'X');   /* буфер не трогаем */
+    Logic_FormatIconText(5, true, b, 1);  CHECK(b[0] == L'\0');
+    Logic_FormatIconText(64, true, b, 3); CHECK(wcscmp(b, L"64") == 0);
+    Logic_FormatIconText(-7, true, b, 16); CHECK(wcscmp(b, L"0") == 0);
+    Logic_FormatIconText(0, false, b, 3); CHECK(wcscmp(b, L"-1") == 0);
+    Logic_FormatIconText(0, false, b, 2); CHECK(wcscmp(b, L"-") == 0);
+    Logic_FormatIconText(0, false, b, 1); CHECK(b[0] == L'\0');
 }
 
 static void test_build_inputs(void)
@@ -218,6 +298,15 @@ static void test_build_inputs(void)
 
     CHECK(Logic_BuildPasteInputs(false, p, 1) == 0);
     CHECK(Logic_BuildPasteInputs(true, NULL, 4) == 0);
+}
+
+static void test_build_inputs_caps(void)
+{
+    PasteInput p[4];
+    CHECK(Logic_BuildPasteInputs(true,  p, 2) == 2);
+    CHECK(Logic_BuildPasteInputs(true,  p, 1) == 0);
+    CHECK(Logic_BuildPasteInputs(false, p, 3) == 0);
+    CHECK(Logic_BuildPasteInputs(false, p, 0) == 0);
 }
 
 /* ================= Настройки ================= */
@@ -271,6 +360,7 @@ static void test_clipboard_roundtrip(void)
 
 int main(void)
 {
+    test_queue_oom_keeps_old();
     test_queue_init();
     test_queue_order();
     test_queue_popback();
@@ -279,14 +369,19 @@ int main(void)
     test_queue_max_items();
     test_queue_max_item_bytes();
     test_queue_max_total_bytes();
+    test_queue_zero_limits();
     test_queue_restore_front();
     test_queue_clear();
     test_queue_stress();
+    test_queue_pushfront_owned_null();
 
     test_intercept_truth_table();
     test_classify();
+    test_classify_own_range();
     test_format_icon();
+    test_format_icon_caps();
     test_build_inputs();
+    test_build_inputs_caps();
 
     test_settings();
 

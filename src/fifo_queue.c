@@ -11,6 +11,15 @@ static void fq_secure_zero(void *p, size_t n)
 
 static size_t fq_bytes(size_t chars) { return chars * sizeof(wchar_t); }
 
+static FqAllocFn fq_alloc = malloc;
+static FqFreeFn  fq_free  = free;
+
+void FQ_SetAllocator(FqAllocFn a, FqFreeFn f)
+{ 
+    fq_alloc = a ? a : malloc;
+    fq_free = f ? f : free;
+}
+
 void FQ_Init(FifoQueue *q)
 {
     if (!q) return;
@@ -26,7 +35,7 @@ void FQ_FreeText(wchar_t *text)
 {
     if (!text) return;
     fq_secure_zero(text, fq_bytes(wcslen(text) + 1));
-    free(text);
+    fq_free(text);
 }
 
 wchar_t *FQ_PopFront(FifoQueue *q)
@@ -38,7 +47,7 @@ wchar_t *FQ_PopFront(FifoQueue *q)
     if (!q->head) q->tail = NULL;
     q->count--;
     q->totalBytes -= fq_bytes(n->chars);
-    free(n);
+    fq_free(n);
     return t;
 }
 
@@ -57,7 +66,7 @@ wchar_t *FQ_PopBack(FifoQueue *q)
     }
     q->count--;
     q->totalBytes -= fq_bytes(n->chars);
-    free(n);
+    fq_free(n);
     return t;
 }
 
@@ -72,23 +81,28 @@ FqPushResult FQ_Push(FifoQueue *q, const wchar_t *text)
 
     size_t chars = wcslen(text) + 1;
     size_t bytes = fq_bytes(chars);
+
     if (bytes > q->maxItemBytes || bytes > q->maxTotalBytes)
         return FQ_PUSH_TOO_LARGE;
-
+    if (q->maxItems == 0)
+        return FQ_PUSH_TOO_LARGE;   /* нулевой лимит: очередь в любом случае пуста */
     if (q->dedup && q->tail && wcscmp(q->tail->text, text) == 0)
         return FQ_PUSH_DUPLICATE;
 
+    /* Сначала выделяем и копируем: при OOM старые элементы обязаны уцелеть. */
+    FqNode *n = (FqNode *)fq_alloc(sizeof(FqNode));
+    if (!n) return FQ_PUSH_NOMEM;
+    wchar_t *copy = (wchar_t *)fq_alloc(bytes);
+    if (!copy) { fq_free(n); return FQ_PUSH_NOMEM; }
+    memcpy(copy, text, bytes);
+
+    /* Только теперь вытесняем. */
     while (q->count >= q->maxItems && q->head) fq_evict_front(q);
     while (q->totalBytes + bytes > q->maxTotalBytes && q->head) fq_evict_front(q);
 
-    FqNode *n = (FqNode *)malloc(sizeof(FqNode));
-    if (!n) return FQ_PUSH_NOMEM;
-    n->text = (wchar_t *)malloc(bytes);
-    if (!n->text) { free(n); return FQ_PUSH_NOMEM; }
-    memcpy(n->text, text, bytes);
+    n->text  = copy;
     n->chars = chars;
-    n->next = NULL;
-
+    n->next  = NULL;
     if (q->tail) q->tail->next = n; else q->head = n;
     q->tail = n;
     q->count++;
@@ -100,7 +114,7 @@ bool FQ_PushFrontOwned(FifoQueue *q, wchar_t *text)
 {
     if (!q || !text) { FQ_FreeText(text); return false; }
     size_t chars = wcslen(text) + 1;
-    FqNode *n = (FqNode *)malloc(sizeof(FqNode));
+    FqNode *n = (FqNode *)fq_alloc(sizeof(FqNode));
     if (!n) { FQ_FreeText(text); return false; } /* владение принято */
     n->text = text;
     n->chars = chars;

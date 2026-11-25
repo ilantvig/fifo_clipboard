@@ -1,20 +1,19 @@
 #include "app_logic.h"
 
-#define VK_CTRL 0x11u
-#define VK_V    0x56u
+#include <windows.h>  /* VK_CONTROL */
 
 bool Logic_ShouldInterceptPaste(uint32_t vk, bool ctrl, bool shift, bool alt,
                                 bool injected, bool fifoMode, size_t queueCount)
 {
     return fifoMode && queueCount > 0 &&
-           ctrl && !shift && !alt && !injected && vk == VK_V;
+           ctrl && !shift && !alt && !injected && vk == 'V';
 }
 
 ClipAction Logic_ClassifyClipboardUpdate(uint32_t seq, uint32_t lastSeenSeq,
                                          uint32_t ownPasteSeq)
 {
     if (seq == lastSeenSeq)  return CLIP_IGNORE_DUP;
-    if (seq == ownPasteSeq)  return CLIP_IGNORE_OWN;
+    if (ownPasteSeq != 0 && (int32_t)(seq - ownPasteSeq) <= 0) return CLIP_IGNORE_OWN;
     return CLIP_PROCESS;
 }
 
@@ -52,9 +51,9 @@ size_t Logic_BuildPasteInputs(bool ctrlHeld, PasteInput *out, size_t cap)
     size_t need = ctrlHeld ? 2u : 4u;
     if (!out || cap < need) return 0;
     size_t i = 0;
-    if (!ctrlHeld) { out[i].vk = VK_CTRL; out[i].keyUp = false; ++i; }
-    out[i].vk = VK_V; out[i].keyUp = false; ++i;
-    out[i].vk = VK_V; out[i].keyUp = true;  ++i;
-    if (!ctrlHeld) { out[i].vk = VK_CTRL; out[i].keyUp = true; ++i; }
+    if (!ctrlHeld) { out[i].vk = VK_CONTROL; out[i].keyUp = false; ++i; }
+    out[i].vk = 'V'; out[i].keyUp = false; ++i;
+    out[i].vk = 'V'; out[i].keyUp = true;  ++i;
+    if (!ctrlHeld) { out[i].vk = VK_CONTROL; out[i].keyUp = true; ++i; }
     return i;
 }

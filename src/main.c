@@ -4,6 +4,9 @@
 #ifndef WINVER
 #define WINVER 0x0A00
 #endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000004   /* NTDDI_WIN10_RS3 */
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <strsafe.h>
@@ -51,16 +54,37 @@ typedef struct {
 static AppState g_app;
 
 /* ---------- DPI ---------- */
+typedef BOOL (WINAPI *fnSetDpiCtx)(DPI_AWARENESS_CONTEXT);
+typedef UINT (WINAPI *fnGetDpiForWindow)(HWND);
+typedef UINT (WINAPI *fnGetDpiForSystem)(void);
+typedef int  (WINAPI *fnGetMetricsForDpi)(int, UINT);
+
+static fnSetDpiCtx          pSetDpiCtx;
+static fnGetDpiForWindow    pGetDpiForWindow;
+static fnGetDpiForSystem    pGetDpiForSystem;
+static fnGetMetricsForDpi   pGetMetricsForDpi;
+
 static void InitDpi(void)
 {
-    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
-        SetProcessDPIAware();
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    if (u) {
+        pSetDpiCtx        = (fnSetDpiCtx)(void *)GetProcAddress(u, "SetProcessDpiAwarenessContext");
+        pGetDpiForWindow  = (fnGetDpiForWindow)(void *)GetProcAddress(u, "GetDpiForWindow");
+        pGetDpiForSystem  = (fnGetDpiForSystem)(void *)GetProcAddress(u, "GetDpiForSystem");
+        pGetMetricsForDpi = (fnGetMetricsForDpi)(void *)GetProcAddress(u, "GetSystemMetricsForDpi");
+    }
+    if (!pSetDpiCtx || !pSetDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        SetProcessDPIAware();   /* XP+ — статический импорт безопасен */
 }
 
 static UINT GetTrayDpi(HWND hwnd)
 {
-    UINT dpi = GetDpiForWindow(hwnd);
-    if (!dpi) dpi = GetDpiForSystem();
+    UINT dpi = pGetDpiForWindow ? pGetDpiForWindow(hwnd) : 0;
+    if (!dpi && pGetDpiForSystem) dpi = pGetDpiForSystem();
+    if (!dpi) {
+        HDC dc = GetDC(NULL);
+        if (dc) { dpi = (UINT)GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(NULL, dc); }
+    }
     if (!dpi) dpi = 96;
     return dpi;
 }
@@ -68,8 +92,14 @@ static UINT GetTrayDpi(HWND hwnd)
 /* ---------- Иконка ---------- */
 static HICON CreateTextIcon(const wchar_t *text, COLORREF fg, COLORREF bg, UINT dpi)
 {
-    int w = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
-    int h = GetSystemMetricsForDpi(SM_CYSMICON, dpi);
+    int w, h;
+    if (pGetMetricsForDpi) {
+        w = pGetMetricsForDpi(SM_CXSMICON, dpi);
+        h = pGetMetricsForDpi(SM_CYSMICON, dpi);
+    } else {
+        w = GetSystemMetrics(SM_CXSMICON);
+        h = GetSystemMetrics(SM_CYSMICON);
+    }
     if (w <= 0 || h <= 0) return NULL;
 
     HDC screen = GetDC(NULL);
@@ -146,7 +176,7 @@ static void UpdateTrayIcon(HWND hwnd)
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = IDI_TRAYICON;
-    nid.uFlags = NIF_MESSAGE | NIF_TIP | (icon ? NIF_ICON : 0);
+    nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | (icon ? NIF_ICON : 0);
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = icon;
     StringCchPrintfW(nid.szTip, ARRAYSIZE(nid.szTip), L"FIFO Clipboard (%s)", label);
@@ -193,12 +223,12 @@ static void ShowContextMenu(HWND hwnd)
 }
 
 /* ---------- Вставка ---------- */
-static void SendPaste(void)
+static bool SendPaste(void)
 {
     PasteInput plan[4];
     bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     size_t n = Logic_BuildPasteInputs(ctrlHeld, plan, 4);
-    if (!n) return;
+    if (!n) return false;
 
     INPUT inputs[4];
     ZeroMemory(inputs, sizeof(inputs));
@@ -207,22 +237,83 @@ static void SendPaste(void)
         inputs[i].ki.wVk = (WORD)plan[i].vk;
         inputs[i].ki.dwFlags = plan[i].keyUp ? KEYEVENTF_KEYUP : 0;
     }
-    SendInput((UINT)n, inputs, sizeof(INPUT));
+
+    UINT sent = SendInput((UINT)n, inputs, sizeof(INPUT));
+    if (sent == 0) return false;            /* ничего не ушло — элемент можно вернуть */
+
+    if (sent != (UINT)n) {
+        /* Часть событий доставлена: обязательно дожимаем KEYUP, иначе Ctrl «залипнет». */
+        INPUT up[2];
+        ZeroMemory(up, sizeof(up));
+        size_t m = 0;
+        up[m].type = INPUT_KEYBOARD; up[m].ki.wVk = 'V'; up[m].ki.dwFlags = KEYEVENTF_KEYUP; ++m;
+        if (!ctrlHeld) {
+            up[m].type = INPUT_KEYBOARD; up[m].ki.wVk = VK_CONTROL; up[m].ki.dwFlags = KEYEVENTF_KEYUP; ++m;
+        }
+        SendInput((UINT)m, up, sizeof(INPUT));
+    }
+    return true;   /* ввод хотя бы частично ушёл — считаем вставку состоявшейся */
 }
 
 static void DoPasteFromQueue(HWND hwnd)
 {
     wchar_t *text = FQ_PopFront(&g_app.queue);
-    if (text) {
-        if (Clipboard_SetUnicodeText(hwnd, text)) {
-            g_app.ownPasteSeq = GetClipboardSequenceNumber();
-            FQ_FreeText(text);
-        } else {
-            FQ_PushFrontOwned(&g_app.queue, text); /* откат: владение передано */
-        }
+    if (!text) { SendPaste(); return; }              /* пустая очередь — обычный Paste */
+
+    if (!Clipboard_SetUnicodeText(hwnd, text)) {
+        FQ_PushFrontOwned(&g_app.queue, text);       /* откат, владение передано */
         UpdateTrayIcon(hwnd);
+        if (g_app.settings.sounds) MessageBeep(MB_ICONHAND);
+        return;                                      /* НЕ шлём Ctrl+V в пустой буфер */
     }
-    SendPaste(); /* даже при пустой очереди — обычный Paste */
+    g_app.ownPasteSeq = GetClipboardSequenceNumber();
+
+    if (SendPaste()) FQ_FreeText(text);
+    else {
+        FQ_PushFrontOwned(&g_app.queue, text);       /* UIPI / elevated / блок ввода */
+        if (g_app.settings.sounds) MessageBeep(MB_ICONHAND);
+    }
+    UpdateTrayIcon(hwnd);
+}
+
+/* IL переднего окна: дорогие вызовы только при смене PID. */
+static bool ForegroundIsElevated(void)
+{
+    static DWORD s_pid = 0;
+    static bool  s_elevated = false;
+
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return false;
+    if (pid == s_pid) return s_elevated;
+
+    s_pid = pid;
+    s_elevated = false;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc) {
+        HANDLE tok = NULL;
+        if (OpenProcessToken(proc, TOKEN_QUERY, &tok)) {
+            union {
+                TOKEN_MANDATORY_LABEL tml;
+                BYTE raw[sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE];
+            } buf;
+            DWORD need = 0;
+            if (GetTokenInformation(tok, TokenIntegrityLevel, &buf, sizeof(buf), &need)) {
+                SID *sid = buf.tml.Label.Sid;
+                PUCHAR cnt = GetSidSubAuthorityCount(sid);
+                if (sid && cnt && *cnt > 0) {
+                    DWORD rid = *GetSidSubAuthority(sid, (DWORD)(*cnt - 1));
+                    s_elevated = (rid >= SECURITY_MANDATORY_HIGH_RID);
+                }
+            }
+            CloseHandle(tok);
+        }
+        CloseHandle(proc);
+    }
+    return s_elevated;
 }
 
 /* ---------- Хук (только дешёвые проверки) ---------- */
@@ -233,7 +324,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         static bool s_vDown = false;
 
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            if (kb->vkCode == 'V') s_vDown = false;
+            if (kb->vkCode == 'V' || kb->vkCode == VK_CONTROL ||
+                kb->vkCode == VK_LCONTROL || kb->vkCode == VK_RCONTROL) s_vDown = false;
         } else if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
             if (kb->vkCode == 'V') {
                 bool repeat = s_vDown;
@@ -246,7 +338,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     if (Logic_ShouldInterceptPaste(kb->vkCode, ctrl, shift, alt, injected,
                                                    g_app.settings.fifoMode,
                                                    FQ_Count(&g_app.queue))) {
-                        PostMessageW(g_app.hwnd, WM_APP_PASTE, 0, 0);
+                        /* В elevated-окно SendInput всё равно не пройдёт (UIPI):
+                           не глотаем клавишу, пусть работает обычная вставка. */
+                        if (ForegroundIsElevated())
+                            return CallNextHookEx(g_app.hook, nCode, wParam, lParam);
+                        if (!PostMessageW(g_app.hwnd, WM_APP_PASTE, 0, 0))
+                            return CallNextHookEx(g_app.hook, nCode, wParam, lParam);
                         return 1; /* блокируем оригинал, вставку синтезируем сами */
                     }
                 }
@@ -262,26 +359,73 @@ static void SaveSettings(void)
     Settings_Save(g_app.iniPath, &g_app.settings);
 }
 
+/* Проверка доступности каталога на запись пробным файлом, не трогая сам ini. */
+static bool DirAllowsWrite(const wchar_t *dir)
+{
+    wchar_t probe[MAX_PATH];
+    if (FAILED(StringCchPrintfW(probe, MAX_PATH, L"%s.fifo_clipboard.probe", dir)))
+        return false;
+    /* CREATE_ALWAYS: перезапишем возможный остаток упавшего прошлого запуска. */
+    HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);  /* файл удалится сам благодаря FILE_FLAG_DELETE_ON_CLOSE */
+    return true;
+}
+
 static void ResolveIniPath(void)
 {
+    wchar_t exeDir[MAX_PATH] = { 0 };
     wchar_t exe[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {
         wchar_t *slash = wcsrchr(exe, L'\\');
         if (slash) {
             *(slash + 1) = L'\0';
-            StringCchPrintfW(g_app.iniPath, MAX_PATH, L"%sfifo_clipboard.ini", exe);
+            StringCchCopyW(exeDir, MAX_PATH, exe);
+            StringCchPrintfW(g_app.iniPath, MAX_PATH, L"%sfifo_clipboard.ini", exeDir);
         }
     }
     if (g_app.iniPath[0] == L'\0')
         StringCchCopyW(g_app.iniPath, MAX_PATH, L"fifo_clipboard.ini");
 
-    /* Если каталог exe недоступен для записи — уходим в APPDATA. */
-    if (!Settings_Save(g_app.iniPath, &g_app.settings)) {
+    /* Проверяем запись пробным файлом, а не созданием самого ini. */
+    if (!DirAllowsWrite(exeDir[0] != L'\0' ? exeDir : L".\\")) {
+        /* Каталог exe недоступен для записи — уходим в %APPDATA%\FifoClipboard. */
         wchar_t appdata[MAX_PATH];
         DWORD k = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
-        if (k > 0 && k < MAX_PATH)
-            StringCchPrintfW(g_app.iniPath, MAX_PATH, L"%s\\fifo_clipboard.ini", appdata);
+        if (k > 0 && k < MAX_PATH) {
+            wchar_t dir[MAX_PATH];
+            if (SUCCEEDED(StringCchPrintfW(dir, MAX_PATH, L"%s\\FifoClipboard", appdata))) {
+                if (CreateDirectoryW(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+                    wchar_t legacy[MAX_PATH], current[MAX_PATH];
+                    if (SUCCEEDED(StringCchPrintfW(legacy,  MAX_PATH, L"%s\\fifo_clipboard.ini", appdata)) &&
+                        SUCCEEDED(StringCchPrintfW(current, MAX_PATH, L"%s\\fifo_clipboard.ini", dir))) {
+                        /* Раньше ini лежал прямо в %APPDATA% — переносим. */
+                        if (GetFileAttributesW(current) == INVALID_FILE_ATTRIBUTES &&
+                            GetFileAttributesW(legacy)  != INVALID_FILE_ATTRIBUTES)
+                            CopyFileW(legacy, current, TRUE);
+                        StringCchCopyW(g_app.iniPath, MAX_PATH, current);
+                    }
+                } else {
+                    StringCchPrintfW(g_app.iniPath, MAX_PATH, L"%s\\fifo_clipboard.ini", appdata);
+                }
+            }
+        }
+    }
+
+    /* Единая точка выхода: путь ВСЕГДА абсолютный.
+       Profile-API трактуют имя без пути как файл в %SystemRoot%. */
+    wchar_t full[MAX_PATH];
+    DWORD f = GetFullPathNameW(g_app.iniPath, MAX_PATH, full, NULL);
+    if (f > 0 && f < MAX_PATH) {
+        StringCchCopyW(g_app.iniPath, MAX_PATH, full);
+    } else {
+        wchar_t tmp[MAX_PATH];
+        DWORD t = GetTempPathW(MAX_PATH, tmp);
+        if (t > 0 && t < MAX_PATH)
+            StringCchPrintfW(g_app.iniPath, MAX_PATH, L"%sfifo_clipboard.ini", tmp);
+        /* иначе оставляем текущий путь: хуже не станет */
     }
 }
 
@@ -383,6 +527,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DPICHANGED:
         UpdateTrayIcon(hwnd);
+        return TRUE;   /* DPI-предложение принято; DefWindowProc вызывать не нужно */
+
+    case WM_ENDSESSION:
+        if (wParam) {
+            /* Сеанс завершается: WM_DESTROY может не прийти, поэтому убираем
+               иконку сами — иначе она "зависнет" в трее до наведения курсора. */
+            RemoveTrayIcon(hwnd);
+        }
         return 0;
 
     case WM_DESTROY:
@@ -438,9 +590,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     L"FIFO Clipboard", MB_ICONWARNING);
 
     bool hkOk = true;
-    hkOk &= RegisterHotKey(g_app.hwnd, HOTKEY_TOGGLE_FIFO, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'F') != 0;
-    hkOk &= RegisterHotKey(g_app.hwnd, HOTKEY_REMOVE_LAST, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'Z') != 0;
-    hkOk &= RegisterHotKey(g_app.hwnd, HOTKEY_EXIT, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'Q') != 0;
+    if (!RegisterHotKey(g_app.hwnd, HOTKEY_TOGGLE_FIFO, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'F')) hkOk = false;
+    if (!RegisterHotKey(g_app.hwnd, HOTKEY_REMOVE_LAST, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'Z')) hkOk = false;
+    if (!RegisterHotKey(g_app.hwnd, HOTKEY_EXIT,        MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'Q')) hkOk = false;
     if (!hkOk)
         MessageBoxW(g_app.hwnd, L"Часть горячих клавиш занята другим приложением.",
                     L"FIFO Clipboard", MB_ICONWARNING);

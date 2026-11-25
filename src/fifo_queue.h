@@ -36,6 +36,10 @@ typedef enum {
     FQ_PUSH_INVALID
 } FqPushResult;
 
+typedef void *(*FqAllocFn)(size_t);
+typedef void  (*FqFreeFn)(void *);
+void         FQ_SetAllocator(FqAllocFn alloc, FqFreeFn dealloc);  /* NULL -> malloc/free */
+
 void         FQ_Init(FifoQueue *q);
 FqPushResult FQ_Push(FifoQueue *q, const wchar_t *text);
 wchar_t     *FQ_PopFront(FifoQueue *q);          /* старый элемент; caller владеет text */

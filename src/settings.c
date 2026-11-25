@@ -4,6 +4,9 @@
 #ifndef WINVER
 #define WINVER 0x0A00
 #endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000004   /* NTDDI_WIN10_RS3 */
+#endif
 #include <windows.h>
 #include "settings.h"
 
@@ -17,10 +20,10 @@ void Settings_Defaults(AppSettings *s)
 bool Settings_Load(const wchar_t *path, AppSettings *s)
 {
     if (!s) return false;
-    Settings_Defaults(s);
+    AppSettings d; Settings_Defaults(&d); *s = d;
     if (!path) return false;
-    s->fifoMode = GetPrivateProfileIntW(L"General", L"FifoMode", 0, path) != 0;
-    s->sounds   = GetPrivateProfileIntW(L"General", L"Sounds",   0, path) != 0;
+    s->fifoMode = GetPrivateProfileIntW(L"General", L"FifoMode", d.fifoMode ? 1 : 0, path) != 0;
+    s->sounds   = GetPrivateProfileIntW(L"General", L"Sounds",   d.sounds   ? 1 : 0, path) != 0;
     return true;
 }
 
