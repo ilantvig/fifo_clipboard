@@ -1,12 +1,12 @@
 @echo off
 setlocal
-set SRC=main.c fifo_queue.c app_logic.c settings.c clipboard.c
-set TESTSRC=tests\test_main.c fifo_queue.c app_logic.c settings.c clipboard.c
+set SRC=src\main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c
+set TESTSRC=tests\test_main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c
 set CC=clang
 set CFLAGS=-std=c11 -Wall -Wextra -O2
 
 if "%1"=="tests" (
-    %CC% %CFLAGS% %TESTSRC% -o fifo_tests.exe -luser32 -lkernel32 %2
+    %CC% %CFLAGS% %TESTSRC% -o fifo_tests.exe -luser32 -lkernel32 %2 -Isrc
     goto :eof
 )
 if "%1"=="msvc" (
