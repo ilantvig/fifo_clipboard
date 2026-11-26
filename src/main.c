@@ -252,7 +252,8 @@ static bool SendPaste(void)
         }
         SendInput((UINT)m, up, sizeof(INPUT));
     }
-    return true;   /* ввод хотя бы частично ушёл — считаем вставку состоявшейся */
+    /* Вставка состоялась, только если ушло само нажатие V. */
+    return sent > (ctrlHeld ? 0u : 1u);
 }
 
 static void DoPasteFromQueue(HWND hwnd)
@@ -303,8 +304,8 @@ static bool ForegroundIsElevated(void)
             DWORD need = 0;
             if (GetTokenInformation(tok, TokenIntegrityLevel, &buf, sizeof(buf), &need)) {
                 SID *sid = buf.tml.Label.Sid;
-                PUCHAR cnt = GetSidSubAuthorityCount(sid);
-                if (sid && cnt && *cnt > 0) {
+                PUCHAR cnt = sid ? GetSidSubAuthorityCount(sid) : NULL;
+                if (cnt && *cnt > 0) {
                     DWORD rid = *GetSidSubAuthority(sid, (DWORD)(*cnt - 1));
                     s_elevated = (rid >= SECURITY_MANDATORY_HIGH_RID);
                 }

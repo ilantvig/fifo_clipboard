@@ -41,7 +41,7 @@
 
 ```ini
 [General]
-FifoMode=1
+FifoMode=0
 Sounds=0
 ```
 
@@ -61,11 +61,11 @@ Sounds=0
 - **Исходное содержимое буфера не восстанавливается.** После FIFO-вставки в буфере
   остаётся вставленный элемент, а не то, что было там до этого.
 - **Очередь живёт только в памяти** и теряется при выходе из приложения.
-- **Окна с повышенными правами.** Если целевое приложение запущено от имени
-  администратора, а утилита — нет, FIFO-вставка невозможна: Windows блокирует
-  синтетический ввод (UIPI). В таких окнах Ctrl+V **не перехватывается** и работает
-  как обычная вставка. Чтобы FIFO работал и там, запускайте утилиту с тем же уровнем
-  прав, что и целевые приложения.
+- **Окна с повышенными правами.** Копирование *из* таких окон работает: текст
+  попадает в очередь как обычно. Вставка *в* такие окна — обычная: Windows
+  блокирует синтетический ввод (UIPI), поэтому Ctrl+V там не перехватывается
+  и вставляет текущее содержимое буфера, а не элемент очереди. Чтобы FIFO-вставка
+  работала и в таких окнах, запускайте утилиту с тем же уровнем прав.
 - **История буфера обмена (Win+V).** Каждая FIFO-вставка меняет системный буфер,
   поэтому попадает в историю Windows.
 - **Клавиатурный хук.** Windows может молча снять низкоуровневый хук, если его
@@ -93,6 +93,11 @@ build.bat asan         :: тесты под ASan/UBSan + запуск
 ```
 
 Предупреждения трактуются как ошибки (`-Werror` / `/WX`).
+Все бинарники складываются в `build\` (каталог добавлен в `.gitignore`).
+Убедитесь, что каталог `build\` существует или выполните команду:
+```bat
+if not exist build mkdir build
+```
 
 ### Вручную
 
@@ -101,7 +106,7 @@ clang / llvm-mingw:
 ```bat
 clang -std=c11 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000004 ^
   -Isrc src\main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c ^
-  -o fifo_clipboard.exe -mwindows -luser32 -lgdi32 -lshell32 -ladvapi32
+  -o build\fifo_clipboard.exe -mwindows -luser32 -lgdi32 -lshell32 -ladvapi32
 ```
 
 gcc (MinGW):
@@ -109,7 +114,7 @@ gcc (MinGW):
 ```bat
 gcc -std=c11 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000004 ^
   -Isrc src\main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c ^
-  -o fifo_clipboard.exe -mwindows -luser32 -lgdi32 -lshell32 -ladvapi32
+  -o build\fifo_clipboard.exe -mwindows -luser32 -lgdi32 -lshell32 -ladvapi32
 ```
 
 Без `-mwindows` при запуске будет открываться консольное окно.
@@ -118,8 +123,8 @@ MSVC (Developer Command Prompt):
 
 ```bat
 cl /nologo /W4 /utf-8 /std:c11 /Isrc /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A000004 ^
-  src\main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c ^
-  /link user32.lib gdi32.lib shell32.lib advapi32.lib /SUBSYSTEM:WINDOWS /OUT:fifo_clipboard.exe
+  /Fobuild\ /Fdbuild\ src\main.c src\fifo_queue.c src\app_logic.c src\settings.c src\clipboard.c ^
+  /link user32.lib gdi32.lib shell32.lib advapi32.lib /SUBSYSTEM:WINDOWS /OUT:build\fifo_clipboard.exe
 ```
 
 `/utf-8` обязателен: в исходниках есть русские строковые литералы.
